@@ -1,0 +1,283 @@
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+index d82c728..19c2336 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+@@ -1235,6 +1235,8 @@ private void changeContainerResourceInternal(ContainerId containerId,
+         // Persist container resource change for recovery
+         this.context.getNMStateStore().storeContainerResourceChanged(
+             containerId, containerVersion, targetResource);
++        this.context.getContainerExecutor().updateContainerResource(
++            containerId, targetResource);
+         getContainersMonitor().handle(
+             new ChangeMonitoringContainerResourceEvent(
+                 containerId, targetResource));
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsBlkioResourceHandlerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsBlkioResourceHandlerImpl.java
+index e0b43d3..46cff7b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsBlkioResourceHandlerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsBlkioResourceHandlerImpl.java
+@@ -26,6 +26,7 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.util.Shell;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperation;
+ 
+@@ -150,6 +151,12 @@ private void checkDiskScheduler() {
+   }
+ 
+   @Override
++  public List<PrivilegedOperation> updateContainerResource(ContainerId containerId,
++      Resource containerResource) throws ResourceHandlerException {
++    return null;
++  }
++
++  @Override
+   public List<PrivilegedOperation> reacquireContainer(ContainerId containerId)
+       throws ResourceHandlerException {
+     return null;
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsCpuResourceHandlerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsCpuResourceHandlerImpl.java
+index d9cca8f..8e03be6 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsCpuResourceHandlerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsCpuResourceHandlerImpl.java
+@@ -184,29 +184,7 @@ public static boolean cpuLimitsExist(String path)
+ 
+     String cgroupId = container.getContainerId().toString();
+     Resource containerResource = container.getResource();
+-    cGroupsHandler.createCGroup(CPU, cgroupId);
+-    try {
+-      int containerVCores = containerResource.getVirtualCores();
+-      int cpuShares = CPU_DEFAULT_WEIGHT * containerVCores;
+-      cGroupsHandler
+-          .updateCGroupParam(CPU, cgroupId, CGroupsHandler.CGROUP_CPU_SHARES,
+-              String.valueOf(cpuShares));
+-      if (strictResourceUsageMode) {
+-        if (nodeVCores != containerVCores) {
+-          float containerCPU =
+-              (containerVCores * yarnProcessors) / (float) nodeVCores;
+-          int[] limits = getOverallLimits(containerCPU);
+-          cGroupsHandler.updateCGroupParam(CPU, cgroupId,
+-              CGroupsHandler.CGROUP_CPU_PERIOD_US, String.valueOf(limits[0]));
+-          cGroupsHandler.updateCGroupParam(CPU, cgroupId,
+-              CGroupsHandler.CGROUP_CPU_QUOTA_US, String.valueOf(limits[1]));
+-        }
+-      }
+-    } catch (ResourceHandlerException re) {
+-      cGroupsHandler.deleteCGroup(CPU, cgroupId);
+-      LOG.warn("Could not update cgroup for container", re);
+-      throw re;
+-    }
++    setupLimits(cgroupId, containerResource, true);
+     List<PrivilegedOperation> ret = new ArrayList<>();
+     ret.add(new PrivilegedOperation(
+         PrivilegedOperation.OperationType.ADD_PID_TO_CGROUP,
+@@ -216,6 +194,14 @@ public static boolean cpuLimitsExist(String path)
+   }
+ 
+   @Override
++  public List<PrivilegedOperation> updateContainerResource(ContainerId containerId,
++      Resource containerResource)
++      throws ResourceHandlerException {
++    setupLimits(containerId.toString(), containerResource, false);
++    return null;
++  }
++
++  @Override
+   public List<PrivilegedOperation> reacquireContainer(ContainerId containerId)
+       throws ResourceHandlerException {
+     return null;
+@@ -232,4 +218,34 @@ public static boolean cpuLimitsExist(String path)
+       throws ResourceHandlerException {
+     return null;
+   }
++
++  private void setupLimits(String cgroupId,
++      Resource containerResource, boolean createCgroup)
++      throws ResourceHandlerException {
++    if(createCgroup){
++      cGroupsHandler.createCGroup(CPU, cgroupId);
++    }
++    try {
++      int containerVCores = containerResource.getVirtualCores();
++      int cpuShares = CPU_DEFAULT_WEIGHT * containerVCores;
++      cGroupsHandler
++          .updateCGroupParam(CPU, cgroupId, CGroupsHandler.CGROUP_CPU_SHARES,
++              String.valueOf(cpuShares));
++      if (strictResourceUsageMode) {
++        if (nodeVCores != containerVCores) {
++          float containerCPU =
++              (containerVCores * yarnProcessors) / (float) nodeVCores;
++          int[] limits = getOverallLimits(containerCPU);
++          cGroupsHandler.updateCGroupParam(CPU, cgroupId,
++              CGroupsHandler.CGROUP_CPU_PERIOD_US, String.valueOf(limits[0]));
++          cGroupsHandler.updateCGroupParam(CPU, cgroupId,
++              CGroupsHandler.CGROUP_CPU_QUOTA_US, String.valueOf(limits[1]));
++        }
++      }
++    } catch (ResourceHandlerException re) {
++      cGroupsHandler.deleteCGroup(CPU, cgroupId);
++      LOG.warn("Could not update cgroup for container", re);
++      throw re;
++    }
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsMemoryResourceHandlerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsMemoryResourceHandlerImpl.java
+index b4d2a9a..03f84cc 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsMemoryResourceHandlerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsMemoryResourceHandlerImpl.java
+@@ -25,6 +25,7 @@
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperation;
+@@ -142,6 +143,12 @@ int getSwappiness() {
+   }
+ 
+   @Override
++  public List<PrivilegedOperation> updateContainerResource(ContainerId containerId,
++      Resource containerResource) throws ResourceHandlerException {
++    return null;
++  }
++
++  @Override
+   public List<PrivilegedOperation> postComplete(ContainerId containerId)
+       throws ResourceHandlerException {
+     cGroupsHandler.deleteCGroup(MEMORY, containerId.toString());
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/ResourceHandler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/ResourceHandler.java
+index 3dfc86b..620173c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/ResourceHandler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/ResourceHandler.java
+@@ -24,6 +24,7 @@
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperation;
+ 
+@@ -59,6 +60,20 @@
+       throws ResourceHandlerException;
+ 
+   /**
++   * Update the resource for container
++   *
++   * @param containerId The id of the container being updated
++   * @param containerResource The resource of the container will be updating
++   * @return (possibly empty) list of operations that require elevated
++   * privileges e.g a) create a custom cgroup b) add pid for container to tasks
++   * file for a cgroup.
++   * @throws ResourceHandlerException
++   */
++  List<PrivilegedOperation> updateContainerResource(ContainerId containerId,
++      Resource containerResource)
++      throws ResourceHandlerException;
++
++  /**
+    * Require state for container that was already launched
+    *
+    * @param containerId if of the container being reacquired.
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/ResourceHandlerChain.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/ResourceHandlerChain.java
+index 955d216..d7bb1eb 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/ResourceHandlerChain.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/ResourceHandlerChain.java
+@@ -24,6 +24,7 @@
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperation;
+ 
+@@ -82,6 +83,24 @@ public ResourceHandlerChain(List<ResourceHandler> resourceHandlers) {
+   }
+ 
+   @Override
++  public List<PrivilegedOperation> updateContainerResource(ContainerId containerId,
++      Resource containerResource) throws ResourceHandlerException {
++    List<PrivilegedOperation> allOperations = new
++        ArrayList<PrivilegedOperation>();
++
++    for (ResourceHandler resourceHandler : resourceHandlers) {
++      List<PrivilegedOperation> handlerOperations =
++          resourceHandler.updateContainerResource(containerId, containerResource);
++
++      if (handlerOperations != null) {
++        allOperations.addAll(handlerOperations);
++      }
++
++    }
++    return allOperations;
++  }
++
++  @Override
+   public List<PrivilegedOperation> reacquireContainer(ContainerId containerId)
+       throws ResourceHandlerException {
+     List<PrivilegedOperation> allOperations = new
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TrafficControlBandwidthHandlerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TrafficControlBandwidthHandlerImpl.java
+index 3bb8035..69600f0 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TrafficControlBandwidthHandlerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TrafficControlBandwidthHandlerImpl.java
+@@ -26,6 +26,7 @@
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperation;
+@@ -172,6 +173,12 @@ public TrafficControlBandwidthHandlerImpl(PrivilegedOperationExecutor
+     return ops;
+   }
+ 
++  @Override
++  public List<PrivilegedOperation> updateContainerResource(ContainerId containerId,
++      Resource containerResource) throws ResourceHandlerException {
++    return null;
++  }
++
+   /**
+    * Reacquires state for a container - reads the classid from the cgroup
+    * being used for the container being reacquired
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TestCGroupsCpuResourceHandlerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TestCGroupsCpuResourceHandlerImpl.java
+index 674cd71..2f0530f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TestCGroupsCpuResourceHandlerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TestCGroupsCpuResourceHandlerImpl.java
+@@ -294,4 +294,35 @@ public void testTeardown() throws Exception {
+   public void testStrictResourceUsage() throws Exception {
+     Assert.assertNull(cGroupsCpuResourceHandler.teardown());
+   }
++
++  @Test
++  public void testupdateContainerResource()throws Exception {
++    String id = "container_01_01";
++    String path = "test-path/" + id;
++    ContainerId mockContainerId = mock(ContainerId.class);
++    when(mockContainerId.toString()).thenReturn(id);
++    Container mockContainer = mock(Container.class);
++    when(mockContainer.getContainerId()).thenReturn(mockContainerId);
++    when(mockCGroupsHandler
++        .getPathForCGroupTasks(CGroupsHandler.CGroupController.CPU, id))
++        .thenReturn(path);
++    when(mockContainer.getResource()).thenReturn(Resource.newInstance(1024, 2));
++    cGroupsCpuResourceHandler.preStart(mockContainer);
++    verify(mockCGroupsHandler, times(1))
++        .createCGroup(CGroupsHandler.CGroupController.CPU, id);
++    verify(mockCGroupsHandler, times(1))
++        .updateCGroupParam(CGroupsHandler.CGroupController.CPU, id,
++            CGroupsHandler.CGROUP_CPU_SHARES, String
++                .valueOf(CGroupsCpuResourceHandlerImpl.CPU_DEFAULT_WEIGHT * 2));
++    // Update container cpu resource
++    when(mockContainer.getResource()).thenReturn(Resource.newInstance(1024, 4));
++    cGroupsCpuResourceHandler.updateContainerResource(mockContainerId,
++        mockContainer.getResource());
++    verify(mockCGroupsHandler, times(1))
++        .createCGroup(CGroupsHandler.CGroupController.CPU, id);
++    verify(mockCGroupsHandler, times(1))
++        .updateCGroupParam(CGroupsHandler.CGroupController.CPU, id,
++            CGroupsHandler.CGROUP_CPU_SHARES, String
++                .valueOf(CGroupsCpuResourceHandlerImpl.CPU_DEFAULT_WEIGHT * 4));
++  }
+ }
